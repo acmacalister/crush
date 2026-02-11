@@ -5,12 +5,18 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/google/uuid"
 )
+
+// publishInterval is the minimum interval between pubsub notifications
+// for the same message during streaming. This prevents the TUI from being
+// overwhelmed by per-token updates while still keeping the UI responsive.
+const publishInterval = 33 * time.Millisecond // ~30 Hz
 
 type CreateMessageParams struct {
 	Role             MessageRole
@@ -35,12 +41,22 @@ type Service interface {
 type service struct {
 	*pubsub.Broker[Message]
 	q db.Querier
+
+	// pendingUpdates stores the latest message state for throttled
+	// publishing. When a message is updated rapidly (e.g., per-token
+	// during streaming), only the latest state is published at most
+	// once per publishInterval.
+	pendingUpdates map[string]Message
+	pendingTimers  map[string]*time.Timer
+	mu             sync.Mutex
 }
 
 func NewService(q db.Querier) Service {
 	return &service{
-		Broker: pubsub.NewBroker[Message](),
-		q:      q,
+		Broker:         pubsub.NewBroker[Message](),
+		q:              q,
+		pendingUpdates: make(map[string]Message),
+		pendingTimers:  make(map[string]*time.Timer),
 	}
 }
 
@@ -53,6 +69,7 @@ func (s *service) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	s.cancelPendingUpdate(id)
 	// Clone the message before publishing to avoid race conditions with
 	// concurrent modifications to the Parts slice.
 	s.Publish(pubsub.DeletedEvent, message.Clone())
@@ -130,10 +147,73 @@ func (s *service) Update(ctx context.Context, message Message) error {
 		return err
 	}
 	message.UpdatedAt = time.Now().Unix()
-	// Clone the message before publishing to avoid race conditions with
-	// concurrent modifications to the Parts slice.
-	s.Publish(pubsub.UpdatedEvent, message.Clone())
+
+	// Publish immediately for finished messages (tool calls completing,
+	// end of turn, etc.) so the UI updates without delay. For streaming
+	// deltas, throttle to avoid overwhelming the TUI.
+	cloned := message.Clone()
+	if message.FinishPart() != nil || len(message.ToolCalls()) > 0 && message.ToolCalls()[len(message.ToolCalls())-1].Finished {
+		s.flushPendingUpdate(message.ID)
+		s.Publish(pubsub.UpdatedEvent, cloned)
+	} else {
+		s.throttledPublish(message.ID, cloned)
+	}
 	return nil
+}
+
+// throttledPublish coalesces rapid update events for the same message.
+// It stores the latest state and schedules a publish after
+// publishInterval. If another update arrives before the timer fires,
+// the stored state is replaced but no additional timer is created.
+func (s *service) throttledPublish(id string, msg Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.pendingUpdates[id] = msg
+
+	if _, exists := s.pendingTimers[id]; !exists {
+		s.pendingTimers[id] = time.AfterFunc(publishInterval, func() {
+			s.mu.Lock()
+			latest, ok := s.pendingUpdates[id]
+			delete(s.pendingUpdates, id)
+			delete(s.pendingTimers, id)
+			s.mu.Unlock()
+
+			if ok {
+				s.Publish(pubsub.UpdatedEvent, latest)
+			}
+		})
+	}
+}
+
+// flushPendingUpdate immediately publishes any pending throttled update
+// for the given message ID and cancels its timer.
+func (s *service) flushPendingUpdate(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if timer, ok := s.pendingTimers[id]; ok {
+		timer.Stop()
+		delete(s.pendingTimers, id)
+	}
+
+	if pending, ok := s.pendingUpdates[id]; ok {
+		delete(s.pendingUpdates, id)
+		s.Publish(pubsub.UpdatedEvent, pending)
+	}
+}
+
+// cancelPendingUpdate cancels any pending throttled update for the
+// given message ID without publishing.
+func (s *service) cancelPendingUpdate(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if timer, ok := s.pendingTimers[id]; ok {
+		timer.Stop()
+		delete(s.pendingTimers, id)
+	}
+	delete(s.pendingUpdates, id)
 }
 
 func (s *service) Get(ctx context.Context, id string) (Message, error) {

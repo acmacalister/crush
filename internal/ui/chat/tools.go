@@ -289,6 +289,7 @@ func (t *baseToolMessageItem) Animate(msg anim.StepMsg) tea.Cmd {
 	if !t.isSpinning() {
 		return nil
 	}
+	t.clearCache()
 	return t.anim.Animate(msg)
 }
 
@@ -300,8 +301,7 @@ func (t *baseToolMessageItem) RawRender(width int) string {
 	}
 
 	content, height, ok := t.getCachedRender(toolItemWidth)
-	// if we are spinning or there is no cache rerender
-	if !ok || t.isSpinning() {
+	if !ok {
 		content = t.toolRenderer.RenderTool(t.sty, toolItemWidth, &ToolRenderOpts{
 			ToolCall:        t.toolCall,
 			Result:          t.result,

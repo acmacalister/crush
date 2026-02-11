@@ -19,16 +19,16 @@ import (
 )
 
 const (
-	fps           = 20
+	fps           = 4
 	initialChar   = '.'
 	labelGap      = " "
 	labelGapWidth = 1
 
 	// Periods of ellipsis animation speed in steps.
 	//
-	// If the FPS is 20 (50 milliseconds) this means that the ellipsis will
-	// change every 8 frames (400 milliseconds).
-	ellipsisAnimSpeed = 8
+	// If the FPS is 4 (250 milliseconds) this means that the ellipsis will
+	// change every 2 frames (500 milliseconds).
+	ellipsisAnimSpeed = 2
 
 	// The maximum amount of time that can pass before a character appears.
 	// This is used to create a staggered entrance effect.
